@@ -1,3 +1,5 @@
 __pycache__/*
 log/*
 network/__pycache__/*
+.vscode/*
+algorithms/layers/__pycache__/*

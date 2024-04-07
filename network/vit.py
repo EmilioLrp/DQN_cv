@@ -1,121 +1,143 @@
-# reference:  https://github.com/lucidrains/vit-pytorch/blob/main/vit_pytorch/simple_vit.py#L64
+from functools import partial
 import torch
-from torch import nn
+import torch.nn as nn
+from algorithms.layers import to_2tuple, trunc_normal_, lecun_normal_
+from collections.abc import Callable, Sequence
+import numpy as np
 
-from einops import rearrange
-from einops.layers.torch import Rearrange
+class Mlp(nn.Module):
+	def __init__(self, in_features, hidden_features=None, out_features=None, act_layer=nn.GELU):
+		super().__init__()
+		out_features = out_features or in_features
+		hidden_features = hidden_features or in_features
+		self.fc1 = nn.Linear(in_features, hidden_features)
+		self.act = act_layer()
+		self.fc2 = nn.Linear(hidden_features, out_features)
 
-# helpers
+	def forward(self, x):
+		x = self.fc1(x)
+		x = self.act(x)
+		x = self.fc2(x)
+		return x
 
-def pair(t):
-    return t if isinstance(t, tuple) else (t, t)
-
-def posemb_sincos_2d(h, w, dim, temperature: int = 10000, dtype = torch.float32):
-    y, x = torch.meshgrid(torch.arange(h), torch.arange(w), indexing="ij")
-    assert (dim % 4) == 0, "feature dimension must be multiple of 4 for sincos emb"
-    omega = torch.arange(dim // 4) / (dim // 4 - 1)
-    omega = 1.0 / (temperature ** omega)
-
-    y = y.flatten()[:, None] * omega[None, :]
-    x = x.flatten()[:, None] * omega[None, :]
-    pe = torch.cat((x.sin(), x.cos(), y.sin(), y.cos()), dim=1)
-    return pe.type(dtype)
-
-# classes
-
-class FeedForward(nn.Module):
-    def __init__(self, dim, hidden_dim):
-        super().__init__()
-        self.net = nn.Sequential(
-            nn.LayerNorm(dim),
-            nn.Linear(dim, hidden_dim),
-            nn.GELU(),
-            nn.Linear(hidden_dim, dim),
-        )
-    def forward(self, x):
-        return self.net(x)
 
 class Attention(nn.Module):
-    def __init__(self, dim, heads = 8, dim_head = 64):
-        super().__init__()
-        inner_dim = dim_head *  heads
-        self.heads = heads
-        self.scale = dim_head ** -0.5
-        self.norm = nn.LayerNorm(dim)
+	def __init__(self, dim, num_heads=8, qkv_bias=False, qk_scale=None):
+		super().__init__()
+		self.num_heads = num_heads
+		head_dim = dim // num_heads
+		self.scale = qk_scale or head_dim ** -0.5
 
-        self.attend = nn.Softmax(dim = -1)
+		self.qkv = nn.Linear(dim, dim * 3, bias=qkv_bias)
+		self.proj = nn.Linear(dim, dim)
 
-        self.to_qkv = nn.Linear(dim, inner_dim * 3, bias = False)
-        self.to_out = nn.Linear(inner_dim, dim, bias = False)
+	def forward(self, x):
+		B, N, C = x.shape
+		qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4)
+		q, k, v = qkv[0], qkv[1], qkv[2]
 
-    def forward(self, x):
-        x = self.norm(x)
+		attn = (q @ k.transpose(-2, -1)) * self.scale
+		attn = attn.softmax(dim=-1)
 
-        qkv = self.to_qkv(x).chunk(3, dim = -1)
-        q, k, v = map(lambda t: rearrange(t, 'b n (h d) -> b h n d', h = self.heads), qkv)
+		x = (attn @ v).transpose(1, 2).reshape(B, N, C)
+		x = self.proj(x)
+		return x
 
-        dots = torch.matmul(q, k.transpose(-1, -2)) * self.scale
 
-        attn = self.attend(dots)
+class Block(nn.Module):
+	def __init__(self, dim, num_heads, mlp_ratio=1., qkv_bias=False, qk_scale=None,
+				 act_layer=nn.GELU, norm_layer=nn.LayerNorm):
+		super().__init__()
+		self.norm1 = norm_layer(dim)
+		self.attn = Attention(
+			dim, num_heads=num_heads, qkv_bias=qkv_bias, qk_scale=qk_scale)
+		self.norm2 = norm_layer(dim)
+		mlp_hidden_dim = int(dim * mlp_ratio)
+		self.mlp = Mlp(in_features=dim, hidden_features=mlp_hidden_dim, act_layer=act_layer)
 
-        out = torch.matmul(attn, v)
-        out = rearrange(out, 'b h n d -> b n (h d)')
-        return self.to_out(out)
+	def forward(self, x):
+		x = x + self.attn(self.norm1(x))
+		x = x + self.mlp(self.norm2(x))
+		return x
 
-class Transformer(nn.Module):
-    def __init__(self, dim, depth, heads, dim_head, mlp_dim):
-        super().__init__()
-        self.norm = nn.LayerNorm(dim)
-        self.layers = nn.ModuleList([])
-        for _ in range(depth):
-            self.layers.append(nn.ModuleList([
-                Attention(dim, heads = heads, dim_head = dim_head),
-                FeedForward(dim, mlp_dim)
-            ]))
-    def forward(self, x):
-        for attn, ff in self.layers:
-            x = attn(x) + x
-            x = ff(x) + x
-        return self.norm(x)
 
-class SimpleViT(nn.Module):
-    def __init__(self, *, image_size, patch_size, num_classes, dim, depth, heads, mlp_dim, channels = 3, dim_head = 64):
-        super().__init__()
-        image_height, image_width = pair(image_size)
-        patch_height, patch_width = pair(patch_size)
+class PatchEmbed(nn.Module):
+	def __init__(self, img_size=84, patch_size=14, in_chans=3, embed_dim=64, norm_layer=None):
+		super().__init__()
+		img_size = to_2tuple(img_size)
+		patch_size = to_2tuple(patch_size)
+		self.img_size = img_size
+		self.patch_size = patch_size
+		self.patch_grid = (img_size[0] // patch_size[0], img_size[1] // patch_size[1])
+		self.num_patches = self.patch_grid[0] * self.patch_grid[1]
+		print('Num patches:', self.num_patches)
 
-        assert image_height % patch_height == 0 and image_width % patch_width == 0, 'Image dimensions must be divisible by the patch size.'
+		self.proj = nn.Conv2d(in_chans, embed_dim, kernel_size=patch_size, stride=patch_size)
+		self.norm = norm_layer(embed_dim) if norm_layer else nn.Identity()
 
-        patch_dim = channels * patch_height * patch_width
+	def forward(self, x):
+		B, C, H, W = x.shape
+		x = self.proj(x).flatten(2).transpose(1, 2)
+		x = self.norm(x)
+		return x
 
-        self.to_patch_embedding = nn.Sequential(
-            Rearrange("b c (h p1) (w p2) -> b (h w) (p1 p2 c)", p1 = patch_height, p2 = patch_width),
-            nn.LayerNorm(patch_dim),
-            nn.Linear(patch_dim, dim),
-            nn.LayerNorm(dim),
-        )
 
-        self.pos_embedding = posemb_sincos_2d(
-            h = image_height // patch_height,
-            w = image_width // patch_width,
-            dim = dim,
-        ) 
+class VisionTransformer(nn.Module):
+	def __init__(self, action_shape: Sequence[int] | int, img_size=84, patch_size=14, in_chans=3, embed_dim=64, depth=4,
+				 num_heads=8, mlp_ratio=4., qkv_bias=True, qk_scale=None, 
+				 device: str | int | torch.device = "cpu"):
+		super().__init__()
+		self.action_dim = int(np.prod(action_shape))
+		self.device = device
+		self.embed_dim = embed_dim
+		norm_layer = partial(nn.LayerNorm, eps=1e-6)
 
-        self.transformer = Transformer(dim, depth, heads, dim_head, mlp_dim)
+		self.patch_embed = PatchEmbed(
+			img_size=img_size, patch_size=patch_size, in_chans=in_chans, embed_dim=embed_dim)
+		num_patches = self.patch_embed.num_patches
 
-        self.pool = "mean"
-        self.to_latent = nn.Identity()
+		self.cls_token = nn.Parameter(torch.zeros(1, 1, embed_dim))
+		self.pos_embed = nn.Parameter(torch.zeros(1, num_patches + 1, embed_dim))
 
-        self.linear_head = nn.Linear(dim, num_classes)
+		self.blocks = nn.Sequential(*[
+			Block(
+				dim=embed_dim, num_heads=num_heads, mlp_ratio=mlp_ratio, qkv_bias=qkv_bias, qk_scale=qk_scale,
+				norm_layer=norm_layer, act_layer=nn.GELU)
+			for i in range(depth)])
+		self.norm = norm_layer(embed_dim)
+		self.output = nn.Linear(in_features=embed_dim, out_features=self.action_dim)
+		# Weight init
+		trunc_normal_(self.pos_embed, std=.02)
+		trunc_normal_(self.cls_token, std=.02)
+		self.apply(_init_vit_weights)
 
-    def forward(self, img):
-        device = img.device
+	@torch.jit.ignore
+	def no_weight_decay(self):
+		return {'pos_embed', 'cls_token'}
+ 
+	def forward(self, x, state, info, **kwargs):
+		x = torch.as_tensor(x, device=self.device, dtype=torch.float32)
+		x = self.patch_embed(x)
+		cls_token = self.cls_token.expand(x.size(0), -1, -1)
+		x = torch.cat((cls_token, x), dim=1)
+		x = x + self.pos_embed
+		x = self.blocks(x)
+		x = self.norm(x)
+		return self.output(x[:, 0]), state
 
-        x = self.to_patch_embedding(img)
-        x += self.pos_embedding.to(device, dtype=x.dtype)
 
-        x = self.transformer(x)
-        x = x.mean(dim = 1)
-
-        x = self.to_latent(x)
-        return self.linear_head(x)
+def _init_vit_weights(m, n: str = '', head_bias: float = 0.):
+	if isinstance(m, nn.Linear):
+		if n.startswith('head'):
+			nn.init.zeros_(m.weight)
+			nn.init.constant_(m.bias, head_bias)
+		elif n.startswith('pre_logits'):
+			lecun_normal_(m.weight)
+			nn.init.zeros_(m.bias)
+		else:
+			trunc_normal_(m.weight, std=.02)
+			if m.bias is not None:
+				nn.init.zeros_(m.bias)
+	elif isinstance(m, nn.LayerNorm):
+		nn.init.zeros_(m.bias)
+		nn.init.ones_(m.weight)
